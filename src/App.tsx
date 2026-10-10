@@ -26,7 +26,6 @@ import {
   Link,
   LinearProgress,
   MenuItem,
-  Menu,
   Pagination,
   Paper,
   Radio,
@@ -42,9 +41,13 @@ import {
   alpha
 } from '@mui/material'
 import { writeText } from '@tauri-apps/api/clipboard'
-import { message, open } from '@tauri-apps/api/dialog'
+import { ask, message, open } from '@tauri-apps/api/dialog'
 import { listen } from '@tauri-apps/api/event'
-import { exists as fsExists, removeFile } from '@tauri-apps/api/fs'
+import {
+  BaseDirectory,
+  exists as fsExists,
+  removeFile
+} from '@tauri-apps/api/fs'
 import {
   appDataDir,
   dirname,
@@ -76,6 +79,7 @@ import {
 import { loadEmojiBinary } from './services/emoji-binary-cache'
 import { copyEmojiFile } from './services/emoji-file-cache'
 import {
+  isValidExportFolderName,
   readExportSettings,
   writeExportSettings
 } from './services/export-settings'
@@ -170,6 +174,9 @@ type IncompleteExport = {
   dirName: string
   groupSize: number
   sortOrder: EmojiSortOrder
+  view?: string
+  selectedItemIds?: string[]
+  selectedItemIndices?: number[]
 }
 
 type ToastState = {
@@ -258,6 +265,16 @@ function orderUrls(
   return sortOrder === 'newest-first' ? [...urls].reverse() : [...urls]
 }
 
+function emojiIdentity(item: IMaybeUrl): string {
+  return (
+    item.md5 ||
+    item._text ||
+    item.downloadUrl ||
+    item.localSourcePath ||
+    item.src
+  )
+}
+
 function App() {
   // wxapp 域名
   const wxappDomain = 'wxapp.tc.qq.com'
@@ -272,11 +289,15 @@ function App() {
   // 预览/下载数据（来源统一为 URL 列表，但对用户隐藏）
   const [rawUrls, setRawUrls] = useState<Array<string>>([])
   const [showImgList, setShowImgList] = useState<Array<IMaybeUrl>>([])
+  const [selectedEmojiIndices, setSelectedEmojiIndices] = useState<Set<number>>(
+    () => new Set()
+  )
   const [copyingEmojiKeys, setCopyingEmojiKeys] = useState<Set<string>>(
     () => new Set()
   )
   const [previewPage, setPreviewPage] = useState(1)
   const previewPageSize = 50
+  const [jumpPageInput, setJumpPageInput] = useState('1')
   const [emojiSortOrder, setEmojiSortOrder] = useState<EmojiSortOrder>(() => {
     const saved = localStorage.getItem(EMOJI_SORT_ORDER_STORAGE_KEY)
     return isEmojiSortOrder(saved) ? saved : 'newest-first'
@@ -295,6 +316,7 @@ function App() {
   // 导出状态
   const [isExporting, setIsExporting] = useState(false)
   const [exportProgress, setExportProgress] = useState(0)
+  const [exportTotal, setExportTotal] = useState(0)
   const [exportOk, setExportOk] = useState(0)
   const [exportSkipped, setExportSkipped] = useState(0)
   const [exportFailed, setExportFailed] = useState(0)
@@ -316,6 +338,12 @@ function App() {
   )
   const [exportAutoOpen, setExportAutoOpen] = useState(
     persistedExportSettings.autoOpen
+  )
+  const [exportSaveDirectory, setExportSaveDirectory] = useState(
+    persistedExportSettings.saveDirectory || ''
+  )
+  const [exportFolderName, setExportFolderName] = useState(
+    persistedExportSettings.folderName || ''
   )
 
   // download 目录路径（用于 open）
@@ -366,6 +394,7 @@ function App() {
   const createdSubDirsRef = useRef<Set<number>>(new Set())
   const copyingEmojiKeysRef = useRef<Set<string>>(new Set())
   const activeFlowWxidRef = useRef<string | null>(null)
+  const selectionViewRef = useRef('favorites')
   const flowActiveRef = useRef(false)
   const albumRequestGenerationRef = useRef(0)
   const activeTargetIdRef = useRef('')
@@ -375,10 +404,10 @@ function App() {
     targetId: string
     generation: number
   } | null>(null)
-  const [settingsAnchorEl, setSettingsAnchorEl] = useState<null | HTMLElement>(
-    null
-  )
-  const openSettings = Boolean(settingsAnchorEl)
+  const [exportDialogScope, setExportDialogScope] = useState<
+    'selected' | 'all' | null
+  >(null)
+  const [autoExportFolderName, setAutoExportFolderName] = useState('')
 
   const valueOfTarget = (t: EmojiTargetMeta) => encodeEmojiTarget(t)
 
@@ -398,6 +427,43 @@ function App() {
   }, [selectedTargetMeta?.mtimeMs])
 
   const isPreviewLoading = previewTaskIntent !== null
+
+  const selectionDatasetKey = useMemo(
+    () => showImgList.map(emojiIdentity).join('\u0001'),
+    [showImgList]
+  )
+
+  useEffect(() => {
+    setSelectedEmojiIndices(new Set())
+  }, [selectedTargetValue, emojiSortOrder, selectionDatasetKey])
+
+  function toggleEmojiSelection(index: number) {
+    if (isExporting) {
+      return
+    }
+    setSelectedEmojiIndices((previous) => {
+      const next = new Set(previous)
+      if (next.has(index)) {
+        next.delete(index)
+      } else {
+        next.add(index)
+      }
+      return next
+    })
+  }
+
+  function selectCurrentPage() {
+    const next = new Set(selectedEmojiIndices)
+    const start = (previewPage - 1) * previewPageSize
+    for (
+      let index = start;
+      index < Math.min(start + previewPageSize, showImgList.length);
+      index++
+    ) {
+      next.add(index)
+    }
+    setSelectedEmojiIndices(next)
+  }
 
   const selectedTargetName = useMemo(() => {
     if (!selectedTargetMeta) {
@@ -491,6 +557,21 @@ function App() {
         showImgList.length
       )} / ${showImgList.length}`
     : ''
+  const previewPageCount = Math.ceil(showImgList.length / previewPageSize)
+
+  useEffect(() => {
+    setJumpPageInput(String(previewPage))
+  }, [previewPage, previewPageCount])
+
+  function jumpToPreviewPage() {
+    const page = Number(jumpPageInput.trim())
+    if (!Number.isInteger(page) || page < 1 || page > previewPageCount) {
+      showToastMessage(`请输入 1–${previewPageCount} 之间的页码`, 'warning')
+      return
+    }
+    setPreviewPage(page)
+    setJumpPageInput(String(page))
+  }
 
   const catalogNotice = useMemo(() => {
     if (flowStage !== 'ready') {
@@ -748,9 +829,18 @@ function App() {
       groupMode: exportGroupMode,
       customGroupSize: exportCustomGroupSize,
       resume: exportResume,
-      autoOpen: exportAutoOpen
+      autoOpen: exportAutoOpen,
+      saveDirectory: exportSaveDirectory,
+      folderName: exportFolderName
     })
-  }, [exportAutoOpen, exportCustomGroupSize, exportGroupMode, exportResume])
+  }, [
+    exportAutoOpen,
+    exportCustomGroupSize,
+    exportFolderName,
+    exportGroupMode,
+    exportResume,
+    exportSaveDirectory
+  ])
 
   useEffect(() => {
     if (!selectedTargetValue) {
@@ -780,7 +870,18 @@ function App() {
           groupSize: parsed.groupSize,
           sortOrder: isEmojiSortOrder(parsed.sortOrder)
             ? parsed.sortOrder
-            : 'oldest-first'
+            : 'oldest-first',
+          ...(typeof parsed.view === 'string' ? { view: parsed.view } : {}),
+          ...(Array.isArray(parsed.selectedItemIds) &&
+          parsed.selectedItemIds.every((id) => typeof id === 'string')
+            ? { selectedItemIds: parsed.selectedItemIds }
+            : {}),
+          ...(Array.isArray(parsed.selectedItemIndices) &&
+          parsed.selectedItemIndices.every(
+            (index) => Number.isInteger(index) && index >= 0
+          )
+            ? { selectedItemIndices: parsed.selectedItemIndices }
+            : {})
         }
         setIncompleteExport(migrated)
         localStorage.setItem(
@@ -914,7 +1015,27 @@ function App() {
   }
 
   function handleViewChange(view: string) {
+    if (view !== 'settings' && view !== selectionViewRef.current) {
+      selectionViewRef.current = view
+      setSelectedEmojiIndices(new Set())
+    }
     setCurrentView(view)
+  }
+
+  async function chooseExportDirectory() {
+    try {
+      const selected = await open({
+        title: '选择表情导出位置',
+        defaultPath: exportSaveDirectory || downloadDirPath || undefined,
+        multiple: false,
+        directory: true
+      })
+      if (typeof selected === 'string' && selected.startsWith('/')) {
+        setExportSaveDirectory(selected)
+      }
+    } catch {
+      showToastMessage('无法选择导出位置，请重试', 'warning')
+    }
   }
 
   async function chooseWeChatApp() {
@@ -1246,6 +1367,9 @@ function App() {
     const intent =
       options.intent ||
       (hadPreview ? ('refresh' as const) : ('initial' as const))
+    if (intent !== 'auto-refresh') {
+      setSelectedEmojiIndices(new Set())
+    }
     activePreviewTaskRef.current = { targetId, generation }
     setPreviewTaskIntent(intent)
     setFlowError(null)
@@ -1615,6 +1739,9 @@ function App() {
     groupSize: number
     resumeExisting: boolean
     sortOrder: EmojiSortOrder
+    view?: string
+    selectedItemIds?: string[]
+    selectedItemIndices?: number[]
   }) {
     if (!showImgList.length) {
       return await message('请先读取表情。', {
@@ -1623,8 +1750,43 @@ function App() {
       })
     }
 
+    if (options.view && options.view !== currentView) {
+      showToastMessage('请先切换到上次导出的分类，再继续导出', 'warning')
+      return
+    }
+
+    const allItems =
+      currentView === 'favorites' && options.sortOrder !== emojiSortOrder
+        ? [...showImgList].reverse()
+        : showImgList
+    let items = allItems
+    if (options.selectedItemIds) {
+      const selectedItems: IMaybeUrl[] = []
+      for (
+        let selectionIndex = 0;
+        selectionIndex < options.selectedItemIds.length;
+        selectionIndex++
+      ) {
+        const index = options.selectedItemIndices?.[selectionIndex]
+        const item = index === undefined ? null : allItems[index]
+        if (
+          !item ||
+          emojiIdentity(item) !== options.selectedItemIds[selectionIndex]
+        ) {
+          showToastMessage(
+            '上次选中的部分表情已无法找到，请重新选择后导出',
+            'warning'
+          )
+          return
+        }
+        selectedItems.push(item)
+      }
+      items = selectedItems
+    }
+
     setIsExporting(true)
     setExportProgress(0)
+    setExportTotal(items.length)
     setExportOk(0)
     setExportSkipped(0)
     setExportFailed(0)
@@ -1632,10 +1794,6 @@ function App() {
     cancelExportRef.current = false
     createdSubDirsRef.current = new Set()
 
-    const items =
-      currentView === 'favorites' && options.sortOrder !== emojiSortOrder
-        ? [...showImgList].reverse()
-        : showImgList
     const fileKeys = buildUniqueFileKeys(
       items.map((i, index) => i.downloadUrl || i._text || String(index + 1))
     )
@@ -1646,19 +1804,23 @@ function App() {
 
     try {
       if (selectedTargetValue) {
-        localStorage.setItem(
-          `wxemoticon_incomplete_export|${selectedTargetValue}`,
-          JSON.stringify({
-            dirName: options.dirName,
-            groupSize: options.groupSize,
-            sortOrder: options.sortOrder
-          })
-        )
-        setIncompleteExport({
+        const record: IncompleteExport = {
           dirName: options.dirName,
           groupSize: options.groupSize,
-          sortOrder: options.sortOrder
-        })
+          sortOrder: options.sortOrder,
+          view: currentView,
+          ...(options.selectedItemIds
+            ? {
+                selectedItemIds: options.selectedItemIds,
+                selectedItemIndices: options.selectedItemIndices
+              }
+            : {})
+        }
+        localStorage.setItem(
+          `wxemoticon_incomplete_export|${selectedTargetValue}`,
+          JSON.stringify(record)
+        )
+        setIncompleteExport(record)
       }
 
       await ensureExportRootDir(options.dirName)
@@ -1795,7 +1957,12 @@ function App() {
     }
   }
 
-  async function startNewExport() {
+  function openExportDialog(scope: 'selected' | 'all') {
+    setAutoExportFolderName(`微信表情包_导出_${formatTimestampForDir()}`)
+    setExportDialogScope(scope)
+  }
+
+  async function startNewExport(selectedOnly = false) {
     if (!showImgList.length) {
       return await message('请先读取表情。', {
         title: '提示',
@@ -1812,18 +1979,67 @@ function App() {
       }
     }
 
-    const dirName = `微信表情包_导出_${formatTimestampForDir()}`
+    const customName = exportFolderName.trim()
+    if (!isValidExportFolderName(customName)) {
+      showToastMessage(
+        '文件夹名称不能包含斜杠、反斜杠、冒号或控制字符',
+        'warning'
+      )
+      return
+    }
+    const folderName =
+      customName ||
+      autoExportFolderName ||
+      `微信表情包_导出_${formatTimestampForDir()}`
+    const dirName = exportSaveDirectory
+      ? await join(exportSaveDirectory, folderName)
+      : folderName
+    try {
+      const alreadyExists = await fsExists(
+        dirName,
+        dirName.startsWith('/') ? undefined : { dir: BaseDirectory.Download }
+      )
+      if (alreadyExists) {
+        const proceed = await ask(
+          '该文件夹已存在。继续导出会写入其中，同名图片会按“断点续跑”设置跳过或覆盖。是否继续？',
+          { title: '目标文件夹已存在', type: 'warning' }
+        )
+        if (!proceed) {
+          return
+        }
+      }
+    } catch {
+      showToastMessage('无法检查目标文件夹，请重新选择保存位置', 'warning')
+      return
+    }
     const groupSize = effectiveGroupSize()
+    const selectedItemIndices = selectedOnly
+      ? [...selectedEmojiIndices].sort((left, right) => left - right)
+      : undefined
+    const selectedItemIds = selectedItemIndices?.map((index) =>
+      emojiIdentity(showImgList[index])
+    )
+    if (selectedOnly && !selectedItemIds?.length) {
+      showToastMessage('请先勾选要导出的表情', 'info')
+      return
+    }
+    setExportDialogScope(null)
     await runExport({
       dirName,
       groupSize,
       resumeExisting: exportResume,
-      sortOrder: emojiSortOrder
+      sortOrder: emojiSortOrder,
+      selectedItemIds,
+      selectedItemIndices
     })
   }
 
   async function continueLastExport() {
     if (!incompleteExport) {
+      return
+    }
+    if (incompleteExport.view && incompleteExport.view !== currentView) {
+      showToastMessage('请先切换到上次导出的分类，再继续导出', 'warning')
       return
     }
     if (incompleteExport.sortOrder !== emojiSortOrder) {
@@ -1841,7 +2057,10 @@ function App() {
       dirName: incompleteExport.dirName,
       groupSize: incompleteExport.groupSize,
       resumeExisting: true,
-      sortOrder: incompleteExport.sortOrder
+      sortOrder: incompleteExport.sortOrder,
+      view: incompleteExport.view,
+      selectedItemIds: incompleteExport.selectedItemIds,
+      selectedItemIndices: incompleteExport.selectedItemIndices
     })
   }
 
@@ -1945,9 +2164,7 @@ function App() {
                         <Tooltip title="导出设置">
                           <IconButton
                             aria-label="导出设置"
-                            onClick={(event) =>
-                              setSettingsAnchorEl(event.currentTarget)
-                            }
+                            onClick={() => openExportDialog('all')}
                             size="small"
                           >
                             <SettingsIcon sx={{ fontSize: 18 }} />
@@ -2176,16 +2393,31 @@ function App() {
                       direction="row"
                       alignItems="center"
                       spacing={0.5}
-                      sx={{ ml: 'auto', flexShrink: 0 }}
+                      useFlexGap
+                      sx={{
+                        ml: 'auto',
+                        minWidth: 0,
+                        flexWrap: 'wrap',
+                        justifyContent: 'flex-end',
+                        rowGap: 0.5
+                      }}
                     >
                       {!isExporting && (
                         <>
+                          <Button
+                            variant="contained"
+                            size="small"
+                            disabled={selectedEmojiIndices.size === 0}
+                            onClick={() => openExportDialog('selected')}
+                          >
+                            导出已选（{selectedEmojiIndices.size}）
+                          </Button>
                           <Button
                             variant="text"
                             color="inherit"
                             size="small"
                             startIcon={<DownloadIcon sx={{ fontSize: 17 }} />}
-                            onClick={startNewExport}
+                            onClick={() => openExportDialog('all')}
                             sx={{
                               color: 'text.secondary',
                               minWidth: 'auto',
@@ -2223,19 +2455,65 @@ function App() {
                         {previewRangeText}
                       </Typography>
                       {showImgList.length > previewPageSize && (
-                        <Pagination
-                          count={Math.ceil(
-                            showImgList.length / previewPageSize
-                          )}
-                          page={previewPage}
-                          onChange={(_, page) => setPreviewPage(page)}
-                          color="primary"
-                          size="small"
-                          siblingCount={0}
-                          boundaryCount={1}
-                        />
+                        <>
+                          <Pagination
+                            count={previewPageCount}
+                            page={previewPage}
+                            onChange={(_, page) => setPreviewPage(page)}
+                            color="primary"
+                            size="small"
+                            siblingCount={0}
+                            boundaryCount={1}
+                          />
+                          <TextField
+                            size="small"
+                            type="number"
+                            value={jumpPageInput}
+                            onChange={(event) =>
+                              setJumpPageInput(event.target.value)
+                            }
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter') {
+                                event.preventDefault()
+                                jumpToPreviewPage()
+                              }
+                            }}
+                            inputProps={{
+                              min: 1,
+                              max: previewPageCount,
+                              'aria-label': '跳转页码'
+                            }}
+                            sx={{ width: 72 }}
+                          />
+                          <Button size="small" onClick={jumpToPreviewPage}>
+                            跳转
+                          </Button>
+                        </>
                       )}
                     </Stack>
+                  </Stack>
+                )}
+
+                {showImgList.length > 0 && !isExporting && (
+                  <Stack
+                    direction="row"
+                    alignItems="center"
+                    spacing={1}
+                    sx={{ mb: 1.5 }}
+                  >
+                    <Typography variant="caption" color="text.secondary">
+                      已选 {selectedEmojiIndices.size} 个表情，可跨页选择
+                    </Typography>
+                    <Button size="small" onClick={selectCurrentPage}>
+                      全选本页
+                    </Button>
+                    <Button
+                      size="small"
+                      disabled={selectedEmojiIndices.size === 0}
+                      onClick={() => setSelectedEmojiIndices(new Set())}
+                    >
+                      清空选择
+                    </Button>
                   </Stack>
                 )}
 
@@ -2267,6 +2545,9 @@ function App() {
                     previewPageSize={previewPageSize}
                     copyEmojiImage={copyEmojiImage}
                     copyingEmojiKeys={copyingEmojiKeys}
+                    selectedIndices={selectedEmojiIndices}
+                    onToggleSelection={toggleEmojiSelection}
+                    selectionDisabled={isExporting}
                     openSystem={openSystem}
                     setShowImgList={setShowImgList}
                     emptyTitle={
@@ -2701,7 +2982,7 @@ function App() {
                 variant="caption"
                 sx={{ fontWeight: 600, color: 'primary.main' }}
               >
-                正在导出 {exportProgress} / {showImgList.length}
+                正在导出 {exportProgress} / {exportTotal}
               </Typography>
               <Typography variant="caption" color="text.secondary">
                 成功 {exportOk} · 跳过 {exportSkipped} · 失败 {exportFailed}
@@ -2709,33 +2990,78 @@ function App() {
             </Stack>
             <LinearProgress
               variant="determinate"
-              value={(exportProgress / showImgList.length) * 100}
+              value={exportTotal ? (exportProgress / exportTotal) * 100 : 0}
               sx={{ height: 3, borderRadius: 0 }}
             />
           </Box>
         )}
       </Box>
 
-      <Menu
-        anchorEl={settingsAnchorEl}
-        open={openSettings}
-        onClose={() => setSettingsAnchorEl(null)}
-        PaperProps={{
-          sx: {
-            width: 292,
-            mt: 0.75,
-            border: '1px solid',
-            borderColor: 'divider',
-            boxShadow: '0 10px 28px rgba(23, 25, 28, 0.14)'
-          }
-        }}
-        transformOrigin={{ horizontal: 'right', vertical: 'top' }}
-        anchorOrigin={{ horizontal: 'right', vertical: 'bottom' }}
+      <Dialog
+        open={exportDialogScope !== null}
+        onClose={() => setExportDialogScope(null)}
+        maxWidth="sm"
+        fullWidth
       >
-        <Box sx={{ px: 2, py: 1.5 }}>
-          <Typography variant="subtitle2" sx={{ mb: 1.25, fontWeight: 700 }}>
-            导出设置
+        <DialogTitle>导出设置</DialogTitle>
+        <DialogContent dividers>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            {exportDialogScope === 'selected'
+              ? `准备导出已选的 ${selectedEmojiIndices.size} 个表情`
+              : `准备导出当前分类的 ${showImgList.length} 个表情`}
           </Typography>
+
+          <TextField
+            fullWidth
+            size="small"
+            label="保存位置"
+            value={exportSaveDirectory || downloadDirPath || '下载'}
+            InputProps={{ readOnly: true }}
+            helperText="未选择时使用系统下载文件夹"
+            sx={{ mb: 1 }}
+          />
+          <Stack direction="row" spacing={1} sx={{ mb: 1.5 }}>
+            <Button
+              size="small"
+              variant="outlined"
+              disabled={isExporting}
+              onClick={() => void chooseExportDirectory()}
+            >
+              选择目录
+            </Button>
+            <Button
+              size="small"
+              disabled={isExporting || !exportSaveDirectory}
+              onClick={() => setExportSaveDirectory('')}
+            >
+              恢复默认位置
+            </Button>
+          </Stack>
+          <TextField
+            fullWidth
+            size="small"
+            label="文件夹名称"
+            value={exportFolderName}
+            onChange={(event) => setExportFolderName(event.target.value)}
+            placeholder="留空则自动生成带时间戳的名称"
+            helperText={
+              exportFolderName.trim()
+                ? '每次导出都会写入这个文件夹'
+                : `本次将使用：${autoExportFolderName}`
+            }
+            disabled={isExporting}
+            sx={{ mb: 2 }}
+          />
+          <Typography
+            variant="body2"
+            color="text.secondary"
+            sx={{ overflowWrap: 'anywhere' }}
+          >
+            将保存到：{exportSaveDirectory || downloadDirPath || '下载'}/
+            {exportFolderName.trim() || autoExportFolderName}
+          </Typography>
+
+          <Divider sx={{ my: 1.5 }} />
 
           <Typography
             variant="caption"
@@ -2822,8 +3148,19 @@ function App() {
             sx={{ display: 'flex' }}
             disabled={isExporting}
           />
-        </Box>
-      </Menu>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, py: 2 }}>
+          <Button onClick={() => setExportDialogScope(null)}>取消</Button>
+          <Button
+            variant="contained"
+            onClick={() =>
+              void startNewExport(exportDialogScope === 'selected')
+            }
+          >
+            开始导出
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       {/* Dialogs and Snackbars */}
       <Dialog
@@ -2838,7 +3175,11 @@ function App() {
         <DialogContent>
           <Stack spacing={2}>
             <Typography variant="body2">
-              文件已保存到“下载/{exportResult?.dirName}”
+              文件已保存到“
+              {exportResult?.dirName.startsWith('/')
+                ? exportResult.dirName
+                : `下载/${exportResult?.dirName}`}
+              ”
             </Typography>
             <Box
               sx={{
@@ -3097,7 +3438,7 @@ function App() {
             variant="contained"
             onClick={() => {
               setResumeSortConflictOpen(false)
-              void startNewExport()
+              openExportDialog('all')
             }}
           >
             按当前排序开始新的导出

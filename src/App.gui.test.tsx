@@ -13,14 +13,18 @@ import App from './App'
 import { clearEmojiBinaryCacheForTests } from './services/emoji-binary-cache'
 
 const mocks = vi.hoisted(() => {
-  const emailFeedbackPostMock = vi.fn(async (..._args: unknown[]) => ({
-    ok: true,
-    status: 200,
-    data: { schemaVersion: 1, status: 'accepted' }
-  }))
+  const emailFeedbackPostMock = vi.fn(async (..._args: unknown[]) => {
+    void _args
+    return {
+      ok: true,
+      status: 200,
+      data: { schemaVersion: 1, status: 'accepted' }
+    }
+  })
 
   return {
     messageMock: vi.fn(async () => {}),
+    askDialogMock: vi.fn(async () => true),
     openDialogMock: vi.fn(
       async (): Promise<string | Array<string> | null> => null
     ),
@@ -84,6 +88,7 @@ const mocks = vi.hoisted(() => {
 })
 
 vi.mock('@tauri-apps/api/dialog', () => ({
+  ask: mocks.askDialogMock,
   message: mocks.messageMock,
   open: mocks.openDialogMock
 }))
@@ -561,6 +566,7 @@ describe('App GUI flow', () => {
     expect(mocks.fetchBinaryWithFallbackMock).toHaveBeenCalledTimes(1)
 
     await user.click(screen.getByRole('button', { name: '导出全部' }))
+    await user.click(screen.getByRole('button', { name: '开始导出' }))
     expect(
       await screen.findByRole('dialog', { name: '导出完成' })
     ).toBeInTheDocument()
@@ -736,6 +742,139 @@ describe('App GUI flow', () => {
       '/Applications/WeChat.app',
       true
     )
+  })
+
+  it('exports only checked emojis from multiple preview pages', async () => {
+    const urls = Array.from(
+      { length: 52 },
+      (_, index) =>
+        `https://wxapp.tc.qq.com/1/stodownload?m=item${index}&filekey=1`
+    )
+    mocks.findEmojiTargetsWithMetaMock.mockResolvedValue([makeV4Target()])
+    mocks.autoDumpEmoticonUrlsV4Mock.mockResolvedValue({
+      wxid: 'wxid_test_123',
+      dbKey: 'a'.repeat(64),
+      dbKeyFile: '/tmp/emoticon_dbkey.txt',
+      urlsFile: '/tmp/emoticon_urls.txt',
+      logFile: '/tmp/emoticon_urls.log',
+      urls
+    })
+    mocks.buildEmoticonCatalogV4Mock.mockResolvedValue(
+      makeFavoritesCatalog(urls)
+    )
+
+    const { user } = await renderApp()
+    await user.click(screen.getByRole('button', { name: '一键获取并预览' }))
+    expect(
+      await screen.findByRole('checkbox', { name: '选择表情 1' })
+    ).toBeInTheDocument()
+    await user.click(screen.getByRole('checkbox', { name: '选择表情 1' }))
+    await user.click(screen.getByRole('button', { name: '设置' }))
+    await user.click(screen.getByRole('button', { name: '个人收藏' }))
+    expect(screen.getByRole('checkbox', { name: '选择表情 1' })).toBeChecked()
+    await user.click(screen.getByRole('button', { name: 'Go to page 2' }))
+    await user.click(screen.getByRole('checkbox', { name: '选择表情 51' }))
+
+    expect(screen.getByRole('button', { name: '导出已选（2）' })).toBeEnabled()
+    await user.click(screen.getByRole('button', { name: '导出已选（2）' }))
+    expect(screen.getByText('准备导出已选的 2 个表情')).toBeInTheDocument()
+    expect(
+      screen.getByRole('radio', { name: '每 50 个分为一组' })
+    ).toBeChecked()
+    expect(mocks.exportOneEmojiMock).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: '开始导出' }))
+
+    const dialog = await screen.findByRole('dialog', { name: '导出完成' })
+    expect(within(dialog).getByText('2')).toBeInTheDocument()
+    expect(mocks.writeUrlsFileMock).toHaveBeenCalledWith(
+      expect.stringMatching(/^微信表情包_导出_/),
+      [urls[51], urls[1]]
+    )
+    expect(mocks.exportOneEmojiMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('jumps directly to a preview page and rejects pages outside the range', async () => {
+    const urls = Array.from(
+      { length: 105 },
+      (_, index) => `https://wxapp.tc.qq.com/1/stodownload?m=page${index}`
+    )
+    mocks.findEmojiTargetsWithMetaMock.mockResolvedValue([makeV4Target()])
+    mocks.autoDumpEmoticonUrlsV4Mock.mockResolvedValue({
+      wxid: 'wxid_test_123',
+      dbKey: 'a'.repeat(64),
+      dbKeyFile: '/tmp/emoticon_dbkey.txt',
+      urlsFile: '/tmp/emoticon_urls.txt',
+      logFile: '/tmp/emoticon_urls.log',
+      urls
+    })
+    mocks.buildEmoticonCatalogV4Mock.mockResolvedValue(
+      makeFavoritesCatalog(urls)
+    )
+
+    const { user } = await renderApp()
+    await user.click(screen.getByRole('button', { name: '一键获取并预览' }))
+    await screen.findByRole('checkbox', { name: '选择表情 1' })
+
+    const pageInput = screen.getByRole('spinbutton', { name: '跳转页码' })
+    expect(pageInput).toHaveValue(1)
+    await user.clear(pageInput)
+    await user.type(pageInput, '3{Enter}')
+    expect(
+      await screen.findByRole('checkbox', { name: '选择表情 101' })
+    ).toBeInTheDocument()
+    expect(pageInput).toHaveValue(3)
+
+    await user.clear(pageInput)
+    await user.type(pageInput, '4')
+    await user.click(screen.getByRole('button', { name: '跳转' }))
+    expect(screen.getByText('请输入 1–3 之间的页码')).toBeInTheDocument()
+    expect(
+      screen.getByRole('checkbox', { name: '选择表情 101' })
+    ).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Go to page 1' }))
+    expect(pageInput).toHaveValue(1)
+  })
+
+  it('resumes an interrupted selected export with its original selection', async () => {
+    const urls = ['oldest', 'middle', 'newest'].map(
+      (name) => `https://wxapp.tc.qq.com/1/stodownload?m=${name}&filekey=1`
+    )
+    const outputDir = '/Users/tester/Pictures/My Stickers/未完成的精选导出'
+    localStorage.setItem(
+      'wxemoticon_incomplete_export|v4|wxid_test_123',
+      JSON.stringify({
+        dirName: outputDir,
+        groupSize: 50,
+        sortOrder: 'newest-first',
+        view: 'favorites',
+        selectedItemIds: [urls[2], urls[0]],
+        selectedItemIndices: [0, 2]
+      })
+    )
+    mocks.findEmojiTargetsWithMetaMock.mockResolvedValue([makeV4Target()])
+    mocks.autoDumpEmoticonUrlsV4Mock.mockResolvedValue({
+      wxid: 'wxid_test_123',
+      dbKey: 'a'.repeat(64),
+      dbKeyFile: '/tmp/emoticon_dbkey.txt',
+      urlsFile: '/tmp/emoticon_urls.txt',
+      logFile: '/tmp/emoticon_urls.log',
+      urls
+    })
+    mocks.buildEmoticonCatalogV4Mock.mockResolvedValue(
+      makeFavoritesCatalog(urls)
+    )
+
+    const { user } = await renderApp()
+    await user.click(screen.getByRole('button', { name: '一键获取并预览' }))
+    await user.click(await screen.findByRole('button', { name: '继续上次' }))
+
+    await screen.findByRole('dialog', { name: '导出完成' })
+    expect(mocks.writeUrlsFileMock).toHaveBeenCalledWith(outputDir, [
+      urls[2],
+      urls[0]
+    ])
+    expect(mocks.exportOneEmojiMock).toHaveBeenCalledTimes(2)
   })
 
   it('does not leave mmbiz previews in a permanent loading state', async () => {
@@ -999,6 +1138,7 @@ describe('App GUI flow', () => {
     ])
 
     await user.click(screen.getByRole('button', { name: '导出全部' }))
+    await user.click(screen.getByRole('button', { name: '开始导出' }))
     await waitFor(() =>
       expect(mocks.fetchBinaryWithFallbackMock).toHaveBeenCalledTimes(3)
     )
@@ -1505,6 +1645,7 @@ describe('App GUI flow', () => {
     await expectPreviewImages(2)
 
     await user.click(screen.getByRole('button', { name: '导出全部' }))
+    await user.click(screen.getByRole('button', { name: '开始导出' }))
 
     const completionDialog = await screen.findByRole('dialog')
     expect(within(completionDialog).getByText('导出完成')).toBeInTheDocument()
@@ -1533,6 +1674,92 @@ describe('App GUI flow', () => {
 
     await waitForElementToBeRemoved(() => screen.queryByRole('dialog'))
     expect(mocks.openExportDirMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('exports into the chosen directory with a custom folder name', async () => {
+    const url = 'https://wxapp.tc.qq.com/1/stodownload?m=chosen&filekey=1'
+    const parentDir = '/Users/tester/Pictures/My Stickers'
+    const outputDir = `${parentDir}/精选表情`
+    mocks.findEmojiTargetsWithMetaMock.mockResolvedValue([makeV4Target()])
+    mocks.autoDumpEmoticonUrlsV4Mock.mockResolvedValue({
+      wxid: 'wxid_test_123',
+      dbKey: 'c'.repeat(64),
+      dbKeyFile: '/tmp/emoticon_dbkey.txt',
+      urlsFile: '/tmp/emoticon_urls.txt',
+      logFile: '/tmp/emoticon_urls.log',
+      urls: [url]
+    })
+    mocks.openDialogMock.mockResolvedValueOnce(parentDir)
+
+    const { user } = await renderApp()
+    await user.click(screen.getByRole('button', { name: '一键获取并预览' }))
+    await screen.findByRole('button', { name: '查看表情大图 1' })
+    await user.click(screen.getByRole('button', { name: '导出全部' }))
+    expect(screen.getByRole('dialog', { name: '导出设置' })).toBeInTheDocument()
+    expect(mocks.ensureExportRootDirMock).not.toHaveBeenCalled()
+    expect(
+      screen.getByText(/将保存到：\/Users\/tester\/Downloads\/微信表情包_导出_/)
+    ).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '选择目录' }))
+    expect(mocks.openDialogMock).toHaveBeenCalledWith({
+      title: '选择表情导出位置',
+      defaultPath: '/Users/tester/Downloads',
+      multiple: false,
+      directory: true
+    })
+    await user.type(
+      screen.getByRole('textbox', { name: '文件夹名称' }),
+      '精选表情'
+    )
+    await user.click(screen.getByRole('button', { name: '开始导出' }))
+    expect(
+      await screen.findByText(`文件已保存到“${outputDir}”`)
+    ).toBeInTheDocument()
+    expect(mocks.ensureExportRootDirMock).toHaveBeenCalledWith(outputDir)
+    expect(mocks.writeUrlsFileMock).toHaveBeenCalledWith(outputDir, [url])
+    expect(mocks.openExportDirMock).toHaveBeenCalledWith(
+      '/Users/tester/Downloads',
+      outputDir
+    )
+    expect(
+      JSON.parse(localStorage.getItem('wxemoticon_export_settings') || '{}')
+    ).toMatchObject({ saveDirectory: parentDir, folderName: '精选表情' })
+  })
+
+  it('asks before writing into an existing named folder', async () => {
+    const url = 'https://wxapp.tc.qq.com/1/stodownload?m=chosen&filekey=1'
+    const outputDir = '/Users/tester/Pictures/My Stickers/精选表情'
+    mocks.findEmojiTargetsWithMetaMock.mockResolvedValue([makeV4Target()])
+    mocks.autoDumpEmoticonUrlsV4Mock.mockResolvedValue({
+      wxid: 'wxid_test_123',
+      dbKey: 'c'.repeat(64),
+      dbKeyFile: '/tmp/emoticon_dbkey.txt',
+      urlsFile: '/tmp/emoticon_urls.txt',
+      logFile: '/tmp/emoticon_urls.log',
+      urls: [url]
+    })
+    mocks.openDialogMock.mockResolvedValueOnce(
+      '/Users/tester/Pictures/My Stickers'
+    )
+
+    const { user } = await renderApp()
+    await user.click(screen.getByRole('button', { name: '一键获取并预览' }))
+    await screen.findByRole('button', { name: '查看表情大图 1' })
+    await user.click(screen.getByRole('button', { name: '导出全部' }))
+    await user.click(screen.getByRole('button', { name: '选择目录' }))
+    await user.type(
+      screen.getByRole('textbox', { name: '文件夹名称' }),
+      '精选表情'
+    )
+    mocks.fsExistsMock.mockImplementation(
+      async (path: string) => path === outputDir
+    )
+    mocks.askDialogMock.mockResolvedValueOnce(false)
+
+    await user.click(screen.getByRole('button', { name: '开始导出' }))
+
+    expect(mocks.askDialogMock).toHaveBeenCalledTimes(1)
+    expect(mocks.ensureExportRootDirMock).not.toHaveBeenCalled()
   })
 
   it('restores all export settings after remounting', async () => {
@@ -1706,6 +1933,7 @@ describe('App GUI flow', () => {
     await expectPreviewImages(2)
 
     await user.click(screen.getByRole('button', { name: '导出全部' }))
+    await user.click(screen.getByRole('button', { name: '开始导出' }))
     await waitFor(() =>
       expect(mocks.fetchBinaryWithFallbackMock).toHaveBeenCalledTimes(2)
     )
@@ -1776,8 +2004,14 @@ describe('App GUI flow', () => {
       await screen.findByRole('button', { name: '查看表情大图 1' })
     ).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '导出全部' }))
+    await user.click(screen.getByRole('button', { name: '开始导出' }))
     await waitFor(() =>
       expect(mocks.fetchBinaryWithFallbackMock).toHaveBeenCalledTimes(1)
+    )
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('dialog', { name: '导出设置' })
+      ).not.toBeInTheDocument()
     )
 
     await user.click(screen.getByRole('button', { name: '设置' }))
@@ -1887,6 +2121,7 @@ describe('App GUI flow', () => {
         name: '按当前排序开始新的导出'
       })
     )
+    await user.click(screen.getByRole('button', { name: '开始导出' }))
 
     expect(
       await screen.findByRole('dialog', { name: '导出完成' })

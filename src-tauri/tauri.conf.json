@@ -22,6 +22,7 @@
         "scope": ["https://*", "http://*"]
       },
       "dialog": {
+        "ask": true,
         "message": true,
         "open": true
       },

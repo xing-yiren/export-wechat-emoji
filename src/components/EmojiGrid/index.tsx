@@ -2,7 +2,13 @@ import type { IMaybeUrl } from '../../types'
 import ContentCopyOutlinedIcon from '@mui/icons-material/ContentCopyOutlined'
 import ImageNotSupportedOutlinedIcon from '@mui/icons-material/ImageNotSupportedOutlined'
 import OpenInNewOutlinedIcon from '@mui/icons-material/OpenInNewOutlined'
-import { Box, CircularProgress, IconButton, Tooltip } from '@mui/material'
+import {
+  Box,
+  Checkbox,
+  CircularProgress,
+  IconButton,
+  Tooltip
+} from '@mui/material'
 import React, { useEffect, useRef, useState } from 'react'
 import { PhotoProvider, PhotoView } from 'react-photo-view'
 import {
@@ -65,6 +71,9 @@ interface EmojiGridProps {
   previewPageSize: number
   copyEmojiImage?: (src: string, itemKey: string) => void
   copyingEmojiKeys?: Set<string>
+  selectedIndices?: Set<number>
+  onToggleSelection?: (index: number) => void
+  selectionDisabled?: boolean
   openSystem: (target: string) => void
   setShowImgList: React.Dispatch<React.SetStateAction<IMaybeUrl[]>>
   emptyTitle?: string
@@ -78,6 +87,9 @@ export const EmojiGrid: React.FC<EmojiGridProps> = ({
   previewPageSize,
   copyEmojiImage,
   copyingEmojiKeys = new Set(),
+  selectedIndices = new Set(),
+  onToggleSelection,
+  selectionDisabled = false,
   openSystem,
   setShowImgList,
   emptyTitle = '还没有可预览的表情',
@@ -389,6 +401,7 @@ export const EmojiGrid: React.FC<EmojiGridProps> = ({
         >
           {currentItems.map((item, index) => {
             const absoluteIndex = pageStart + index + 1
+            const isSelected = selectedIndices.has(absoluteIndex - 1)
             const previewSrc = getBrowserPreviewSrc(item.src)
             const itemKey = `${item._text}|${absoluteIndex}`
             const isCopying = copyingEmojiKeys.has(itemKey)
@@ -409,7 +422,8 @@ export const EmojiGrid: React.FC<EmojiGridProps> = ({
                 className="emoji-card"
                 sx={{
                   minWidth: 0,
-                  border: '1px solid #E1E4E7',
+                  border: isSelected ? '2px solid' : '1px solid #E1E4E7',
+                  borderColor: isSelected ? 'primary.main' : undefined,
                   borderRadius: 1,
                   bgcolor: '#F7F8F9',
                   overflow: 'hidden',
@@ -434,6 +448,25 @@ export const EmojiGrid: React.FC<EmojiGridProps> = ({
                     bgcolor: '#F7F8F9'
                   }}
                 >
+                  {onToggleSelection && (
+                    <Checkbox
+                      checked={isSelected}
+                      disabled={selectionDisabled}
+                      onChange={() => onToggleSelection(absoluteIndex - 1)}
+                      onClick={(event) => event.stopPropagation()}
+                      inputProps={{ 'aria-label': `选择表情 ${absoluteIndex}` }}
+                      sx={{
+                        position: 'absolute',
+                        top: 5,
+                        left: 5,
+                        zIndex: 2,
+                        p: 0.4,
+                        borderRadius: 1,
+                        bgcolor: 'rgba(255, 255, 255, 0.94)',
+                        '&:hover': { bgcolor: '#FFFFFF' }
+                      }}
+                    />
+                  )}
                   {previewLoading ? (
                     <CircularProgress size={22} thickness={3.5} />
                   ) : previewFailed ? (

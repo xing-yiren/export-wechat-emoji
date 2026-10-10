@@ -9,9 +9,13 @@ import { join } from '@tauri-apps/api/path'
 import { Command } from '@tauri-apps/api/shell'
 import { getUrlParam } from '../utils/url'
 
+function fsOptionsForPath(path: string) {
+  return path.startsWith('/') ? {} : { dir: BaseDirectory.Download }
+}
+
 export async function ensureExportRootDir(customEmotionsDirName: string) {
   await createDir(customEmotionsDirName, {
-    dir: BaseDirectory.Download,
+    ...fsOptionsForPath(customEmotionsDirName),
     recursive: true
   })
 }
@@ -22,11 +26,11 @@ export async function writeUsageReadme(
 ) {
   const metaDir = `${customEmotionsDirName}/导出信息`
   await createDir(metaDir, {
-    dir: BaseDirectory.Download,
+    ...fsOptionsForPath(metaDir),
     recursive: true
   })
   await writeTextFile(`${metaDir}/使用说明.txt`, content, {
-    dir: BaseDirectory.Download
+    ...fsOptionsForPath(metaDir)
   })
 }
 
@@ -36,12 +40,12 @@ export async function writeUrlsFile(
 ) {
   const metaDir = `${customEmotionsDirName}/导出信息`
   await createDir(metaDir, {
-    dir: BaseDirectory.Download,
+    ...fsOptionsForPath(metaDir),
     recursive: true
   })
   const content = `${urls.join('\n')}\n`
   await writeTextFile(`${metaDir}/emoticon_urls.txt`, content, {
-    dir: BaseDirectory.Download
+    ...fsOptionsForPath(metaDir)
   })
 }
 
@@ -51,12 +55,12 @@ export async function writeDbKeyFile(
 ) {
   const metaDir = `${customEmotionsDirName}/导出信息`
   await createDir(metaDir, {
-    dir: BaseDirectory.Download,
+    ...fsOptionsForPath(metaDir),
     recursive: true
   })
   const content = `${dbKey.trim()}\n`
   await writeTextFile(`${metaDir}/emoticon_dbkey.txt`, content, {
-    dir: BaseDirectory.Download
+    ...fsOptionsForPath(metaDir)
   })
 }
 
@@ -128,7 +132,7 @@ export async function exportedEmojiExistsByKey(options: {
   const exts = ['gif', 'jpg', 'png', 'webp'] as const
   for (const ext of exts) {
     const p = `${subDirPath}/${key}.${ext}`
-    if (await exists(p, { dir: BaseDirectory.Download })) {
+    if (await exists(p, fsOptionsForPath(p))) {
       return true
     }
   }
@@ -155,7 +159,7 @@ export async function exportOneEmoji(options: {
     if (!options.createdSubDirs.has(subDirNumber)) {
       options.createdSubDirs.add(subDirNumber)
       await createDir(subDirPath, {
-        dir: BaseDirectory.Download,
+        ...fsOptionsForPath(subDirPath),
         recursive: true
       })
     }
@@ -166,7 +170,7 @@ export async function exportOneEmoji(options: {
   await writeBinaryFile(
     `${subDirPath}/${fileKey}.${options.ext}`,
     new Uint8Array(options.buffer),
-    { dir: BaseDirectory.Download }
+    fsOptionsForPath(subDirPath)
   )
 }
 
@@ -174,8 +178,10 @@ export async function openExportDir(
   downloadDirPath: string,
   customEmotionsDirName: string
 ) {
-  const path = customEmotionsDirName
-    ? await join(downloadDirPath, customEmotionsDirName)
-    : downloadDirPath
+  const path = customEmotionsDirName.startsWith('/')
+    ? customEmotionsDirName
+    : customEmotionsDirName
+      ? await join(downloadDirPath, customEmotionsDirName)
+      : downloadDirPath
   await new Command('open-dir', [path]).execute()
 }

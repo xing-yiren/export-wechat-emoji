@@ -8,6 +8,8 @@ export type PersistedExportSettingsV1 = {
   customGroupSize: number
   resume: boolean
   autoOpen: boolean
+  saveDirectory?: string
+  folderName?: string
 }
 
 export const DEFAULT_EXPORT_SETTINGS: PersistedExportSettingsV1 = {
@@ -40,6 +42,16 @@ export function normalizeCustomGroupSize(value: unknown): number {
   return Math.floor(value)
 }
 
+export function isValidExportFolderName(value: string): boolean {
+  const name = value.trim()
+  return (
+    name !== '.' &&
+    name !== '..' &&
+    !/[\\/:]/.test(name) &&
+    !Array.from(name).some((character) => character.charCodeAt(0) < 32)
+  )
+}
+
 export function normalizeExportSettings(
   value: unknown
 ): PersistedExportSettingsV1 {
@@ -60,7 +72,14 @@ export function normalizeExportSettings(
     autoOpen:
       typeof value.autoOpen === 'boolean'
         ? value.autoOpen
-        : DEFAULT_EXPORT_SETTINGS.autoOpen
+        : DEFAULT_EXPORT_SETTINGS.autoOpen,
+    ...(typeof value.saveDirectory === 'string' &&
+    value.saveDirectory.startsWith('/')
+      ? { saveDirectory: value.saveDirectory }
+      : {}),
+    ...(typeof value.folderName === 'string' && value.folderName.length > 0
+      ? { folderName: value.folderName }
+      : {})
   }
 }
 
